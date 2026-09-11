@@ -31,41 +31,72 @@ def _question_ref(content: str) -> str:
 _GENIE_TIMEOUT = aiohttp.ClientTimeout(total=None, connect=10, sock_connect=10, sock_read=60)
 
 
-#: Shown to the caller when the Genie test cannot run as them. Fixed text — it
+#: Shown to the caller when the Genie test cannot run at all. Fixed text — it
 #: carries no upstream detail, so it is safe to return verbatim.
 GENIE_IDENTITY_REQUIRED = (
-    "The Genie test runs on-behalf-of you, and no user token was forwarded. Ask a workspace "
-    "admin to enable user authorization for this app (and grant it a Genie API scope). "
-    "Running the test as the app service principal would answer with the service "
-    "principal's data access rather than yours."
+    "The Genie test could not run. It runs on-behalf-of you where the workspace allows it, "
+    "and this deployment has the app service principal fallback switched off. Ask a workspace "
+    "admin to enable user authorization for this app with a Genie API scope."
 )
 
 
 class GenieIdentityUnavailable(Exception):
-    """The viewer's own token cannot call the Genie API and SP fallback is off."""
+    """No identity is available to make a Genie call."""
 
 
-def _genie_auth_headers() -> tuple[dict, str]:
-    """Auth headers for a Genie Conversation API call, plus the identity used.
+def _genie_identities() -> list[tuple[dict, str]]:
+    """The identities to try for a Genie call, best first.
 
     A Genie answer carries ROWS from the customer's warehouse back to the caller,
-    so the identity this runs as decides what that caller is allowed to see. It
-    used to be hard-wired to the app service principal, which holds SELECT on every
-    assessed catalog — so any viewer could read any table through it (CWE-269).
+    so the identity it runs as decides what that caller is allowed to see. It used
+    to be hard-wired to the app service principal, which holds SELECT on every
+    assessed catalog, so any viewer could read any table through it (CWE-269).
 
-    On-behalf-of the viewer is the only identity that makes the answer reflect the
-    caller's own grants, so it is preferred. Falling back to the service principal
-    re-opens the escalation, so it happens only when a deployment has explicitly
-    accepted that (``GENIE_ALLOW_SP_FALLBACK``).
+    The viewer's own token is therefore preferred. But the ``sql`` user API scope
+    does not cover the Genie Conversation API, so a workspace that has not granted
+    a Genie scope will reject that token — which is why the service principal stays
+    in the list behind it. ``_post_with_identity`` walks this list, falling back on
+    an authorization rejection exactly as ``execute_sql`` does for SQL reads.
     """
+    attempts: list[tuple[dict, str]] = []
     if get_user_token():
-        return get_auth_headers(), "obo"
+        attempts.append((get_auth_headers(), "obo"))
     if GENIE_ALLOW_SP_FALLBACK:
-        logger.warning(
-            "Genie call running as the app service principal — the answer reflects the SP's "
-            "grants, not the viewer's (GENIE_ALLOW_SP_FALLBACK is on)"
-        )
-        return get_auth_headers(force_sp=True), "service_principal"
+        attempts.append((get_auth_headers(force_sp=True), "service_principal"))
+    if not attempts:
+        raise GenieIdentityUnavailable(GENIE_IDENTITY_REQUIRED)
+    return attempts
+
+
+async def _post_with_identity(
+    session: aiohttp.ClientSession, url: str, payload: dict
+) -> tuple[dict, dict, str]:
+    """POST to the Genie API as the best identity that the workspace accepts.
+
+    Returns (response json, the headers that worked, the identity that served it) —
+    the caller reuses those headers for polling so the whole exchange runs as one
+    identity.
+    """
+    attempts = _genie_identities()
+    for i, (auth, identity) in enumerate(attempts):
+        headers = {**auth, "Content-Type": "application/json"}
+        async with session.post(url, json=payload, headers=headers) as response:
+            if response.status in (401, 403) and i + 1 < len(attempts):
+                logger.warning(
+                    "Genie call as %s was rejected (%s); retrying as %s",
+                    identity, response.status, attempts[i + 1][1],
+                )
+                continue
+            if response.status != 200:
+                error_text = await response.text()
+                logger.error(f"Genie API error ({response.status}): {error_text[:2000]}")
+                raise Exception(f"Genie API error ({response.status})")
+            if identity == "service_principal":
+                logger.warning(
+                    "Genie answer served by the app service principal — it reflects the "
+                    "service principal's data access, not the viewer's"
+                )
+            return await response.json(), headers, identity
     raise GenieIdentityUnavailable(GENIE_IDENTITY_REQUIRED)
 
 
@@ -76,29 +107,18 @@ async def start_conversation(content: str) -> dict:
     Then poll for result.
     """
     host = get_workspace_host()
-    auth_headers, identity = _genie_auth_headers()
 
     if not host:
         raise Exception("DATABRICKS_HOST not configured")
-    if not auth_headers:
-        raise Exception("No authentication headers available")
 
     url = f"{host}/api/2.0/genie/spaces/{GENIE_SPACE_ID}/start-conversation"
-    headers = {**auth_headers, "Content-Type": "application/json"}
-
     payload = {"content": content}
 
     logger.info("Starting Genie conversation: question=%s len=%d",
                 _question_ref(content), len(content or ""))
 
     async with aiohttp.ClientSession(timeout=_GENIE_TIMEOUT) as session:
-        async with session.post(url, json=payload, headers=headers) as response:
-            if response.status != 200:
-                error_text = await response.text()
-                logger.error(f"Genie start-conversation error ({response.status}): {error_text[:2000]}")
-                raise Exception(f"Genie API error ({response.status})")
-
-            result = await response.json()
+        result, auth_headers, identity = await _post_with_identity(session, url, payload)
 
         conversation_id = result.get("conversation_id")
         message_id = result.get("message_id")
@@ -128,32 +148,21 @@ async def send_message(conversation_id: str, content: str) -> dict:
     Then poll for result.
     """
     host = get_workspace_host()
-    auth_headers, identity = _genie_auth_headers()
 
     if not host:
         raise Exception("DATABRICKS_HOST not configured")
-    if not auth_headers:
-        raise Exception("No authentication headers available")
 
     url = (
         f"{host}/api/2.0/genie/spaces/{GENIE_SPACE_ID}"
         f"/conversations/{conversation_id}/messages"
     )
-    headers = {**auth_headers, "Content-Type": "application/json"}
-
     payload = {"content": content}
 
     logger.info("Sending Genie message in conv=%s: question=%s len=%d",
                 conversation_id, _question_ref(content), len(content or ""))
 
     async with aiohttp.ClientSession(timeout=_GENIE_TIMEOUT) as session:
-        async with session.post(url, json=payload, headers=headers) as response:
-            if response.status != 200:
-                error_text = await response.text()
-                logger.error(f"Genie send-message error ({response.status}): {error_text[:2000]}")
-                raise Exception(f"Genie API error ({response.status})")
-
-            result = await response.json()
+        result, auth_headers, identity = await _post_with_identity(session, url, payload)
 
         message_id = result.get("id") or result.get("message_id")
 

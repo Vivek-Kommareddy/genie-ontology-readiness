@@ -321,43 +321,103 @@ class SecurityHeadersTest(unittest.IsolatedAsyncioTestCase):
 
 
 class GenieIdentityTest(unittest.TestCase):
-    """CWE-269 — a Genie answer returns warehouse rows, so it must not run with
-    the app service principal's data access on a viewer's behalf."""
+    """CWE-269 — a Genie answer returns warehouse rows, so the viewer's own identity
+    is preferred. But the `sql` user API scope does not cover the Genie API, so the
+    service principal has to stay available behind it or the feature breaks in every
+    workspace that enables user authorization."""
 
-    def test_uses_the_viewer_token_when_one_is_forwarded(self):
+    def _identities(self, token, fallback):
         from server import genie_client
-
-        with patch.object(genie_client, "get_user_token", lambda: "viewer-token"), \
+        with patch.object(genie_client, "get_user_token", lambda: token), \
+             patch.object(genie_client, "GENIE_ALLOW_SP_FALLBACK", fallback), \
              patch.object(genie_client, "get_auth_headers",
-                          lambda force_sp=False: {"Authorization": "Bearer viewer-token"}):
-            headers, identity = genie_client._genie_auth_headers()
-        self.assertEqual(identity, "obo")
+                          lambda force_sp=False: {"Authorization": "Bearer sp" if force_sp else "Bearer viewer"}):
+            return [name for _, name in genie_client._genie_identities()]
 
-    def test_answers_via_the_service_principal_by_default(self):
-        # Default behaviour is unchanged from before: with no viewer token the
-        # question is still answered, so the feature works without user
-        # authorization enabled. The identity is reported, and logged.
+    def test_viewer_token_is_tried_first(self):
+        self.assertEqual(self._identities("viewer-token", True)[0], "obo")
+
+    def test_service_principal_stays_available_behind_the_viewer(self):
+        # Without this the feature breaks wherever the forwarded token lacks a
+        # Genie scope, which is every deployment using the default `sql` scope.
+        self.assertEqual(self._identities("viewer-token", True), ["obo", "service_principal"])
+
+    def test_service_principal_alone_when_no_viewer_token(self):
+        self.assertEqual(self._identities(None, True), ["service_principal"])
+
+    def test_lockdown_leaves_only_the_viewer(self):
+        self.assertEqual(self._identities("viewer-token", False), ["obo"])
+
+    def test_lockdown_with_no_viewer_token_raises(self):
         from server import genie_client
-
-        with patch.object(genie_client, "get_user_token", lambda: None), \
-             patch.object(genie_client, "GENIE_ALLOW_SP_FALLBACK", True), \
-             patch.object(genie_client, "get_auth_headers",
-                          lambda force_sp=False: {"Authorization": "Bearer sp"}):
-            with self.assertLogs(level="WARNING"):
-                _, identity = genie_client._genie_auth_headers()
-        self.assertEqual(identity, "service_principal")
-
-    def test_can_be_locked_down_to_the_viewer_only(self):
-        from server import genie_client
-
         with patch.object(genie_client, "get_user_token", lambda: None), \
              patch.object(genie_client, "GENIE_ALLOW_SP_FALLBACK", False):
             with self.assertRaises(genie_client.GenieIdentityUnavailable):
-                genie_client._genie_auth_headers()
+                genie_client._genie_identities()
 
-    def test_default_is_permissive_so_the_feature_keeps_working(self):
+    def test_default_keeps_the_feature_working(self):
         from server.config import GENIE_ALLOW_SP_FALLBACK
         self.assertTrue(GENIE_ALLOW_SP_FALLBACK)
+
+
+class GenieFallbackTest(unittest.IsolatedAsyncioTestCase):
+    """An authorization rejection of the viewer's token must fall through to the
+    service principal, mirroring how execute_sql handles the same situation."""
+
+    class _Resp:
+        def __init__(self, status, payload=None):
+            self.status, self._payload = status, payload or {}
+        async def __aenter__(self): return self
+        async def __aexit__(self, *a): return False
+        async def json(self): return self._payload
+        async def text(self): return "denied"
+
+    class _Session:
+        def __init__(self, statuses):
+            self.statuses, self.seen = list(statuses), []
+        def post(self, url, json=None, headers=None):
+            self.seen.append(headers.get("Authorization"))
+            return GenieFallbackTest._Resp(self.statuses.pop(0), {"conversation_id": "c", "message_id": "m"})
+
+    async def _run(self, statuses, token="viewer-token"):
+        from server import genie_client
+        session = self._Session(statuses)
+        with patch.object(genie_client, "get_user_token", lambda: token), \
+             patch.object(genie_client, "GENIE_ALLOW_SP_FALLBACK", True), \
+             patch.object(genie_client, "get_auth_headers",
+                          lambda force_sp=False: {"Authorization": "Bearer sp" if force_sp else "Bearer viewer"}):
+            with self.assertLogs(level="WARNING"):
+                result, headers, identity = await genie_client._post_with_identity(session, "u", {})
+        return session, headers, identity
+
+    async def test_falls_back_when_the_viewer_token_is_rejected(self):
+        # 403 is what a workspace returns when the forwarded token has no Genie scope.
+        session, headers, identity = await self._run([403, 200])
+        self.assertEqual(session.seen, ["Bearer viewer", "Bearer sp"])
+        self.assertEqual(identity, "service_principal")
+        self.assertEqual(headers["Authorization"], "Bearer sp")
+
+    async def test_no_fallback_when_the_viewer_token_works(self):
+        from server import genie_client
+        session = self._Session([200])
+        with patch.object(genie_client, "get_user_token", lambda: "viewer-token"), \
+             patch.object(genie_client, "GENIE_ALLOW_SP_FALLBACK", True), \
+             patch.object(genie_client, "get_auth_headers",
+                          lambda force_sp=False: {"Authorization": "Bearer sp" if force_sp else "Bearer viewer"}):
+            _, headers, identity = await genie_client._post_with_identity(session, "u", {})
+        self.assertEqual(session.seen, ["Bearer viewer"])
+        self.assertEqual(identity, "obo")
+
+    async def test_a_non_authorization_error_is_not_retried(self):
+        from server import genie_client
+        session = self._Session([500])
+        with patch.object(genie_client, "get_user_token", lambda: "viewer-token"), \
+             patch.object(genie_client, "GENIE_ALLOW_SP_FALLBACK", True), \
+             patch.object(genie_client, "get_auth_headers",
+                          lambda force_sp=False: {"Authorization": "Bearer sp" if force_sp else "Bearer viewer"}):
+            with self.assertRaises(Exception):
+                await genie_client._post_with_identity(session, "u", {})
+        self.assertEqual(session.seen, ["Bearer viewer"])
 
 
 class ProbeFailureNoteTest(unittest.TestCase):
