@@ -1,5 +1,4 @@
-"""Shared infrastructure for all route modules: response cache, the authenticated
-principal dependency, and FM API streaming."""
+"""Shared infrastructure for all route modules: response cache + FM API streaming."""
 
 import time
 import json
