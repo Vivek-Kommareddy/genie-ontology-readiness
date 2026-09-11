@@ -67,6 +67,7 @@ def render_app_yml():
     set_env("LAKEBASE_HOST", _LAKEBASE["host"])
     set_env("LAKEBASE_USER", _LAKEBASE["sp_client_id"])
     set_env("LAKEBASE_DATABASE", LAKEBASE_DATABASE)
+    set_env("LAKEBASE_SSL_MODE", LAKEBASE_SSL_MODE)
     set_env("LAKEBASE_INSTANCE_NAME", LAKEBASE_INSTANCE)
 
     out.write_text(text)

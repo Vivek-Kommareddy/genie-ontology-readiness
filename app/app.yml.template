@@ -19,8 +19,8 @@ env:
   - name: LAKEBASE_SSL_MODE
     value: "verify-full"
   # Optional: enable the live Genie answer-quality test (pillar 5).
-  # A Genie answer returns ROWS from your warehouse, so the test runs
-  # on-behalf-of the viewer and needs user authorization enabled on the app.
+  # A Genie answer returns rows from your warehouse. The test runs on-behalf-of
+  # the viewer where the workspace allows it; see GENIE_ALLOW_SP_FALLBACK below.
   - name: GENIE_SPACE_ID
     value: ""
   # The Genie test runs on-behalf-of the viewer whenever a viewer token is
