@@ -8,7 +8,7 @@ import aiohttp
 from contextvars import ContextVar
 from typing import Optional
 
-from fastapi import Header, HTTPException
+from fastapi import Header
 
 from server.security import resolve_principal, safe_error
 
@@ -27,17 +27,11 @@ async def current_principal(
     Every per-user route depends on this instead of reading the forwarded email
     header directly, so ownership is bound to an identity the app established —
     from the forwarded token where one exists — rather than to a header value a
-    caller could set (CWE-290). A request the app cannot attribute is rejected
-    rather than served from a shared anonymous bucket (CWE-639).
+    caller could set (CWE-290). This always resolves to a usable key, so no
+    request is ever refused for lack of an identity.
     """
-    principal = await resolve_principal(forwarded_email=x_forwarded_email,
-                                        forwarded_token=x_forwarded_access_token)
-    if principal is None:
-        raise HTTPException(
-            status_code=401,
-            detail="Your identity could not be established, so per-user history is unavailable.",
-        )
-    return principal
+    return await resolve_principal(forwarded_email=x_forwarded_email,
+                                   forwarded_token=x_forwarded_access_token)
 
 # ---------------------------------------------------------------------------
 # Lightweight server-side response cache. The assessment is relatively

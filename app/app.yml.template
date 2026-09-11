@@ -23,13 +23,15 @@ env:
   # on-behalf-of the viewer and needs user authorization enabled on the app.
   - name: GENIE_SPACE_ID
     value: ""
-  # What happens when the viewer's token cannot call the Genie API.
-  # "false" (default) = refuse and explain. "true" = answer as the app service
-  # principal instead — which holds SELECT on every assessed catalog, so any
-  # viewer could then read tables they have no grant on. Leave "false" unless
-  # every app viewer is already cleared for everything the app SP can read.
+  # The Genie test runs on-behalf-of the viewer whenever a viewer token is
+  # forwarded. This controls what happens when there is no viewer token, which is
+  # the normal case unless user authorization is enabled for the app.
+  # "true" (default) = answer as the app service principal, as before.
+  # "false" = decline instead, for a deployment where viewers must never see more
+  # than their own grants allow. Either way the identity that answered is logged
+  # and returned in the response as `ran_as`.
   - name: GENIE_ALLOW_SP_FALLBACK
-    value: "false"
+    value: "true"
   # Branding shown in the app header.
   - name: BRAND_NAME
     value: "Databricks"

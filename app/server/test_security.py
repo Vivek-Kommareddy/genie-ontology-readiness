@@ -219,9 +219,14 @@ class PrincipalResolutionTest(unittest.IsolatedAsyncioTestCase):
             await security.resolve_principal(forwarded_email="  Jane.Doe@Example.com ", forwarded_token=None),
             "jane.doe@example.com")
 
-    async def test_deployed_with_no_identity_is_unattributable(self):
+    async def test_deployed_with_no_identity_still_resolves(self):
+        # Never refuse a request for lack of an identity: that would make a user's
+        # own history unreachable over an infrastructure hiccup.
         with patch("server.config.IS_DATABRICKS_APP", True):
-            self.assertIsNone(await security.resolve_principal(None, None))
+            with self.assertLogs(level="WARNING"):
+                principal = await security.resolve_principal(None, None)
+        self.assertEqual(principal, security.UNATTRIBUTED_PRINCIPAL)
+        self.assertTrue(principal)
 
     async def test_local_development_gets_an_explicit_principal_never_null(self):
         with patch("server.config.IS_DATABRICKS_APP", False):
@@ -328,7 +333,21 @@ class GenieIdentityTest(unittest.TestCase):
             headers, identity = genie_client._genie_auth_headers()
         self.assertEqual(identity, "obo")
 
-    def test_refuses_rather_than_escalating_when_no_viewer_token(self):
+    def test_answers_via_the_service_principal_by_default(self):
+        # Default behaviour is unchanged from before: with no viewer token the
+        # question is still answered, so the feature works without user
+        # authorization enabled. The identity is reported, and logged.
+        from server import genie_client
+
+        with patch.object(genie_client, "get_user_token", lambda: None), \
+             patch.object(genie_client, "GENIE_ALLOW_SP_FALLBACK", True), \
+             patch.object(genie_client, "get_auth_headers",
+                          lambda force_sp=False: {"Authorization": "Bearer sp"}):
+            with self.assertLogs(level="WARNING"):
+                _, identity = genie_client._genie_auth_headers()
+        self.assertEqual(identity, "service_principal")
+
+    def test_can_be_locked_down_to_the_viewer_only(self):
         from server import genie_client
 
         with patch.object(genie_client, "get_user_token", lambda: None), \
@@ -336,15 +355,9 @@ class GenieIdentityTest(unittest.TestCase):
             with self.assertRaises(genie_client.GenieIdentityUnavailable):
                 genie_client._genie_auth_headers()
 
-    def test_service_principal_fallback_is_opt_in_only(self):
-        from server import genie_client
-
-        with patch.object(genie_client, "get_user_token", lambda: None), \
-             patch.object(genie_client, "GENIE_ALLOW_SP_FALLBACK", True), \
-             patch.object(genie_client, "get_auth_headers",
-                          lambda force_sp=False: {"Authorization": "Bearer sp"}):
-            _, identity = genie_client._genie_auth_headers()
-        self.assertEqual(identity, "service_principal")
+    def test_default_is_permissive_so_the_feature_keeps_working(self):
+        from server.config import GENIE_ALLOW_SP_FALLBACK
+        self.assertTrue(GENIE_ALLOW_SP_FALLBACK)
 
 
 class ProbeFailureNoteTest(unittest.TestCase):

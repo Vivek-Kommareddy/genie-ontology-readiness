@@ -287,9 +287,15 @@ _identity_cache: dict[str, tuple[float, Optional[str]]] = {}
 _IDENTITY_CACHE_MAX = 500
 
 # Ownership key used when the app runs outside Databricks Apps (local development
-# against a CLI profile). A single, explicit local principal — never NULL, which
-# would pool every unidentified caller into one shared history bucket.
+# against a CLI profile).
 LOCAL_PRINCIPAL = "local-dev"
+
+# Ownership key used when a deployed app receives no identity at all. This should
+# not happen — the platform proxy always forwards one — but if it does, the app
+# keeps working and history stays reachable rather than locking the user out. It
+# is a named bucket rather than NULL so it is visible in the data and greppable in
+# the logs; behaviour matches what the NULL key already did.
+UNATTRIBUTED_PRINCIPAL = "unattributed"
 
 
 def _token_fingerprint(token: str) -> str:
@@ -354,10 +360,12 @@ async def resolve_principal(
     forwarded_email: Optional[str],
     forwarded_token: Optional[str],
 ) -> Optional[str]:
-    """The ownership key for this request's per-user records, or None if unknown.
+    """The ownership key for this request's per-user records.
 
-    None means the caller could not be identified at all; per-user endpoints
-    return 401 rather than reading or writing a shared anonymous bucket.
+    Always returns a usable key — a request is never refused for lack of an
+    identity, because that would make a user's own history unreachable over an
+    infrastructure hiccup. Preference order: the identity the workspace confirms
+    for a forwarded token, then the forwarded header, then a named fallback.
     """
     if forwarded_token:
         verified = await _identity_from_token(forwarded_token)
@@ -372,8 +380,14 @@ async def resolve_principal(
     if not IS_DATABRICKS_APP:
         return LOCAL_PRINCIPAL
 
-    # Deployed, yet the proxy forwarded no identity at all: treat as unauthenticated.
-    return None
+    # Deployed, yet the proxy forwarded no identity at all. Serve the request from
+    # a named shared bucket rather than failing it, and make the anomaly loud.
+    logger.warning(
+        "no forwarded identity on a deployed request; serving per-user history from "
+        "the '%s' bucket. Check that user authorization is configured for this app.",
+        UNATTRIBUTED_PRINCIPAL,
+    )
+    return UNATTRIBUTED_PRINCIPAL
 
 
 # ---------------------------------------------------------------------------

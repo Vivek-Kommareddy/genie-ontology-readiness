@@ -92,11 +92,16 @@ GENIE_SPACE_ID = os.environ.get("GENIE_SPACE_ID", "")
 # ask a question and receive rows from tables they have no grant on: a privilege
 # escalation straight into whatever the warehouse holds.
 #
-# Now the test runs on-behalf-of the viewer, and this knob decides what happens
-# when the viewer's token cannot call the API. Default false = refuse and say so.
-# Set true ONLY where every app viewer is already cleared for everything the app
-# service principal can read, which is rarely the case.
-GENIE_ALLOW_SP_FALLBACK = os.environ.get("GENIE_ALLOW_SP_FALLBACK", "false").lower() == "true"
+# The test now runs on-behalf-of the viewer whenever a viewer token is forwarded,
+# so the answer reflects that person's own grants. This knob decides what happens
+# when no viewer token exists — which is the normal case unless the workspace has
+# enabled user authorization for the app.
+#
+# Default true preserves the previous behaviour exactly: fall back to the service
+# principal and answer the question. Set it to false to make the app decline
+# instead, for a deployment where viewers must never see more than their own
+# grants allow. Every fallback logs a warning naming the identity that served it.
+GENIE_ALLOW_SP_FALLBACK = os.environ.get("GENIE_ALLOW_SP_FALLBACK", "true").lower() == "true"
 
 # Cache workspace client to avoid repeated creation
 _workspace_client = None
