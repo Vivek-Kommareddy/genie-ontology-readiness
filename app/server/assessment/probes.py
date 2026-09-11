@@ -32,6 +32,7 @@ import json
 import logging
 import aiohttp
 
+from server.security import quote_ident, quote_literal, safe_error
 from server.sql_client import execute_sql, record_rest_identity
 from server.config import (
     get_workspace_host,
@@ -44,6 +45,10 @@ from server.config import (
 
 logger = logging.getLogger(__name__)
 
+# Bound every probe REST read. A probe that never returns holds its worker slot
+# and its connection open, and the assessment fan-out multiplies that (CWE-400).
+_PROBE_TIMEOUT = aiohttp.ClientTimeout(total=30, connect=10, sock_connect=10, sock_read=20)
+
 # Catalogs that are never part of a customer's own data estate.
 # Excluded from the *Unity Catalog* footprint. `hive_metastore` is the legacy
 # workspace-local metastore (not UC) — it is counted separately for UC coverage.
@@ -52,6 +57,21 @@ _INTERNAL_CATALOGS = ("system", "__databricks_internal", "samples", "hive_metast
 
 def _empty(note: str) -> dict:
     return {"available": False, "score": 0.0, "signals": [], "gaps": [], "note": note, "metrics": {}}
+
+
+def _failed(exc: Exception, what: str, remedy: str = "") -> dict:
+    """An unavailable-pillar result for a probe that raised.
+
+    The probe's note is returned to the browser AND persisted inside the saved
+    snapshot, so it must never carry the upstream message: SQL Warehouse errors
+    quote the failing statement, the object names involved and sometimes a literal
+    value from a column (CWE-209). The detail goes to the log under `reference`.
+    """
+    reference, _ = safe_error(exc, f"probe: {what}", logger)
+    note = f"{what} could not be read."
+    if remedy:
+        note += f" {remedy}"
+    return _empty(f"{note} (reference {reference})")
 
 
 def _no_catalogs_note(what: str) -> str:
@@ -228,7 +248,7 @@ async def _do_resolve_sources() -> dict:
         async def _readable(c: str) -> bool:
             async with _sem:
                 try:
-                    await execute_sql(f"SELECT 1 FROM `{c}`.information_schema.tables LIMIT 1")
+                    await execute_sql(f"SELECT 1 FROM {quote_ident(c)}.information_schema.tables LIMIT 1")
                     return True
                 except Exception:
                     return False
@@ -250,7 +270,9 @@ def _src(view: str, sources: dict) -> str | None:
     cats = sources["catalogs"]
     if not cats:
         return None
-    union = " UNION ALL ".join(f"SELECT * FROM `{c}`.information_schema.{view}" for c in cats)
+    union = " UNION ALL ".join(
+        f"SELECT * FROM {quote_ident(c)}.information_schema.{view}" for c in cats
+    )
     return f"({union}) AS _t"
 
 
@@ -356,8 +378,8 @@ async def probe_uc_foundation() -> dict:
             },
         }
     except Exception as e:
-        logger.warning(f"probe_uc_foundation failed: {e}")
-        return _empty(f"Could not read information_schema ({str(e)[:120]}). The app SP may lack catalog access.")
+        return _failed(e, "The Unity Catalog footprint",
+                       "The assessing identity may lack USE CATALOG + SELECT on the catalogs to assess.")
 
 
 # ---------------------------------------------------------------------------
@@ -390,10 +412,12 @@ def _coverage_query(view: str, catalogs_batch: list[str], system_ok: bool) -> st
     measured over one consistent population.
     """
     if system_ok:
-        in_list = ", ".join("'" + c.replace("'", "''") + "'" for c in catalogs_batch)
+        in_list = ", ".join(quote_literal(c) for c in catalogs_batch)
         return (_COV_SELECT + f"system.information_schema.{view} "
                 f"WHERE table_catalog IN ({in_list}) AND table_schema <> 'information_schema'")
-    union = " UNION ALL ".join(f"SELECT * FROM `{c}`.information_schema.{view}" for c in catalogs_batch)
+    union = " UNION ALL ".join(
+        f"SELECT * FROM {quote_ident(c)}.information_schema.{view}" for c in catalogs_batch
+    )
     return _COV_SELECT + f"({union}) AS _c WHERE table_schema <> 'information_schema'"
 
 
@@ -476,7 +500,7 @@ async def probe_metadata() -> dict:
         # the same internal catalogs here so both halves of the 50/50 score measure
         # the same population. (Per-catalog _src is already scoped to that list.)
         if system_ok:
-            internal_list = ", ".join("'" + c + "'" for c in _INTERNAL_CATALOGS)
+            internal_list = ", ".join(quote_literal(c) for c in _INTERNAL_CATALOGS)
             tables_query = (_COV_SELECT + "system.information_schema.tables "
                             "WHERE table_schema <> 'information_schema' "
                             f"AND table_catalog NOT IN ({internal_list})")
@@ -538,8 +562,7 @@ async def probe_metadata() -> dict:
             "metrics": {"table_comment_pct": table_pct, "column_comment_pct": col_pct, "tagged_tables": tagged_tables},
         }
     except Exception as e:
-        logger.warning(f"probe_metadata failed: {e}")
-        return _empty(f"Could not read comment coverage ({str(e)[:120]}).")
+        return _failed(e, "Comment coverage")
 
 
 # ---------------------------------------------------------------------------
@@ -595,8 +618,7 @@ async def probe_relationships() -> dict:
         return {"available": True, "score": score, "signals": signals, "gaps": gaps, "note": note,
                 "metrics": {"primary_keys": pk, "foreign_keys": fk, "gold_tables": gold_tables, "constraints_available": constraints_available}}
     except Exception as e:
-        logger.warning(f"probe_relationships failed: {e}")
-        return _empty(f"Could not assess relationships ({str(e)[:120]}).")
+        return _failed(e, "Relationships and modeling")
 
 
 # ---------------------------------------------------------------------------
@@ -682,8 +704,7 @@ async def probe_metrics() -> dict:
             "metrics": {"metric_views": metric_views, "metric_views_commented": commented},
         }
     except Exception as e:
-        logger.warning(f"probe_metrics failed: {e}")
-        return _empty(f"Could not count metric views ({str(e)[:120]}).")
+        return _failed(e, "The metric-view footprint")
 
 
 # ---------------------------------------------------------------------------
@@ -713,7 +734,7 @@ async def _inspect_space(host: str, headers: dict, sid: str, title: str) -> tupl
       ("error", None)       — transient/other failure
     """
     try:
-        async with aiohttp.ClientSession() as session:
+        async with aiohttp.ClientSession(timeout=_PROBE_TIMEOUT) as session:
             async with session.get(
                 f"{host}/api/2.0/genie/spaces/{sid}",
                 headers=headers, params={"include_serialized_space": "true"},
@@ -874,7 +895,7 @@ async def _native_domains() -> int | None:
         f"{host}/api/2.0/data-domains",
     ):
         try:
-            async with aiohttp.ClientSession() as session:
+            async with aiohttp.ClientSession(timeout=_PROBE_TIMEOUT) as session:
                 async with session.get(url, headers=headers) as resp:
                     if resp.status == 200:
                         data = await resp.json()
@@ -904,9 +925,9 @@ async def probe_domains() -> dict:
     if tt is None:
         return _empty("Domains API unavailable and no readable catalogs for the tag proxy; use the self-assessment.")
     try:
-        domain_keys = ", ".join(f"'{k}'" for k in _DOMAIN_TAG_KEYS)
-        steward_keys = ", ".join(f"'{k}'" for k in _STEWARD_TAG_KEYS)
-        cert_keys = ", ".join(f"'{k}'" for k in _CERT_TAG_KEYS)
+        domain_keys = ", ".join(quote_literal(k) for k in _DOMAIN_TAG_KEYS)
+        steward_keys = ", ".join(quote_literal(k) for k in _STEWARD_TAG_KEYS)
+        cert_keys = ", ".join(quote_literal(k) for k in _CERT_TAG_KEYS)
 
         parts = [f"SELECT tag_value FROM {tt} WHERE lower(tag_name) IN ({domain_keys})"]
         if st is not None:
@@ -1050,8 +1071,9 @@ async def probe_domains() -> dict:
                         "source": "tag_proxy"},
         }
     except Exception as e:
-        logger.warning(f"probe_domains failed: {e}")
-        return _empty(f"Domains API unavailable and tag proxy failed ({str(e)[:120]}); use the self-assessment.")
+        return _failed(e, "Domains and stewardship",
+                       "The native Domains API was unavailable and the governed-tag proxy also failed; "
+                       "use the self-assessment.")
 
 
 # ---------------------------------------------------------------------------
@@ -1121,8 +1143,7 @@ async def probe_adoption() -> dict:
         return {"available": True, "score": score, "signals": signals, "gaps": [], "note": None,
                 "metrics": {"active_users_30d": active_users, "queries_30d": queries_30d}}
     except Exception as e:
-        logger.warning(f"probe_adoption failed: {e}")
-        return _empty(f"Could not read adoption signals ({str(e)[:120]}).")
+        return _failed(e, "Adoption signals")
 
 
 # Map pillar key -> probe coroutine

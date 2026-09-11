@@ -2,10 +2,71 @@
 
 import aiohttp
 import asyncio
+import hashlib
 import logging
-from server.config import get_workspace_host, get_auth_headers, GENIE_SPACE_ID
+from server.config import (
+    GENIE_ALLOW_SP_FALLBACK,
+    GENIE_SPACE_ID,
+    get_auth_headers,
+    get_user_token,
+    get_workspace_host,
+)
 
 logger = logging.getLogger(__name__)
+
+# Genie questions are free text typed against the customer's own warehouse, so a
+# question can quote values from the data itself. The text is therefore treated as
+# sensitive: log a stable digest for correlation and its length, never the content
+# (CWE-532). An audit trail needs to identify the request, not copy its contents.
+_QUESTION_DIGEST_LEN = 12
+
+
+def _question_ref(content: str) -> str:
+    """A short, stable, non-reversible reference for one question."""
+    return hashlib.sha256((content or "").encode("utf-8")).hexdigest()[:_QUESTION_DIGEST_LEN]
+
+
+# Bound every Genie REST call. Without a timeout a stalled upstream holds the
+# connection and the worker slot open indefinitely (CWE-400).
+_GENIE_TIMEOUT = aiohttp.ClientTimeout(total=None, connect=10, sock_connect=10, sock_read=60)
+
+
+#: Shown to the caller when the Genie test cannot run as them. Fixed text — it
+#: carries no upstream detail, so it is safe to return verbatim.
+GENIE_IDENTITY_REQUIRED = (
+    "The Genie test runs on-behalf-of you, and no user token was forwarded. Ask a workspace "
+    "admin to enable user authorization for this app (and grant it a Genie API scope). "
+    "Running the test as the app service principal would answer with the service "
+    "principal's data access rather than yours."
+)
+
+
+class GenieIdentityUnavailable(Exception):
+    """The viewer's own token cannot call the Genie API and SP fallback is off."""
+
+
+def _genie_auth_headers() -> tuple[dict, str]:
+    """Auth headers for a Genie Conversation API call, plus the identity used.
+
+    A Genie answer carries ROWS from the customer's warehouse back to the caller,
+    so the identity this runs as decides what that caller is allowed to see. It
+    used to be hard-wired to the app service principal, which holds SELECT on every
+    assessed catalog — so any viewer could read any table through it (CWE-269).
+
+    On-behalf-of the viewer is the only identity that makes the answer reflect the
+    caller's own grants, so it is preferred. Falling back to the service principal
+    re-opens the escalation, so it happens only when a deployment has explicitly
+    accepted that (``GENIE_ALLOW_SP_FALLBACK``).
+    """
+    if get_user_token():
+        return get_auth_headers(), "obo"
+    if GENIE_ALLOW_SP_FALLBACK:
+        logger.warning(
+            "Genie call running as the app service principal — the answer reflects the SP's "
+            "grants, not the viewer's (GENIE_ALLOW_SP_FALLBACK is on)"
+        )
+        return get_auth_headers(force_sp=True), "service_principal"
+    raise GenieIdentityUnavailable(GENIE_IDENTITY_REQUIRED)
 
 
 async def start_conversation(content: str) -> dict:
@@ -15,7 +76,7 @@ async def start_conversation(content: str) -> dict:
     Then poll for result.
     """
     host = get_workspace_host()
-    auth_headers = get_auth_headers(force_sp=True)  # Genie REST API via SP (OBO token lacks genie scope)
+    auth_headers, identity = _genie_auth_headers()
 
     if not host:
         raise Exception("DATABRICKS_HOST not configured")
@@ -27,14 +88,15 @@ async def start_conversation(content: str) -> dict:
 
     payload = {"content": content}
 
-    logger.info(f"Starting Genie conversation: {content[:80]}...")
+    logger.info("Starting Genie conversation: question=%s len=%d",
+                _question_ref(content), len(content or ""))
 
-    async with aiohttp.ClientSession() as session:
+    async with aiohttp.ClientSession(timeout=_GENIE_TIMEOUT) as session:
         async with session.post(url, json=payload, headers=headers) as response:
             if response.status != 200:
                 error_text = await response.text()
-                logger.error(f"Genie start-conversation error ({response.status}): {error_text}")
-                raise Exception(f"Genie API error ({response.status}): {error_text}")
+                logger.error(f"Genie start-conversation error ({response.status}): {error_text[:2000]}")
+                raise Exception(f"Genie API error ({response.status})")
 
             result = await response.json()
 
@@ -42,7 +104,7 @@ async def start_conversation(content: str) -> dict:
         message_id = result.get("message_id")
 
         if not conversation_id or not message_id:
-            raise Exception(f"Missing conversation_id or message_id in response: {result}")
+            raise Exception("Genie API response was missing conversation_id or message_id")
 
         logger.info(f"Genie conversation started: conv={conversation_id}, msg={message_id}")
 
@@ -54,6 +116,7 @@ async def start_conversation(content: str) -> dict:
         return {
             "conversation_id": conversation_id,
             "message_id": message_id,
+            "ran_as": identity,
             "result": _extract_result(message_result),
         }
 
@@ -65,7 +128,7 @@ async def send_message(conversation_id: str, content: str) -> dict:
     Then poll for result.
     """
     host = get_workspace_host()
-    auth_headers = get_auth_headers(force_sp=True)  # Genie REST API via SP (OBO token lacks genie scope)
+    auth_headers, identity = _genie_auth_headers()
 
     if not host:
         raise Exception("DATABRICKS_HOST not configured")
@@ -80,21 +143,22 @@ async def send_message(conversation_id: str, content: str) -> dict:
 
     payload = {"content": content}
 
-    logger.info(f"Sending Genie message in conv={conversation_id}: {content[:80]}...")
+    logger.info("Sending Genie message in conv=%s: question=%s len=%d",
+                conversation_id, _question_ref(content), len(content or ""))
 
-    async with aiohttp.ClientSession() as session:
+    async with aiohttp.ClientSession(timeout=_GENIE_TIMEOUT) as session:
         async with session.post(url, json=payload, headers=headers) as response:
             if response.status != 200:
                 error_text = await response.text()
-                logger.error(f"Genie send-message error ({response.status}): {error_text}")
-                raise Exception(f"Genie API error ({response.status}): {error_text}")
+                logger.error(f"Genie send-message error ({response.status}): {error_text[:2000]}")
+                raise Exception(f"Genie API error ({response.status})")
 
             result = await response.json()
 
         message_id = result.get("id") or result.get("message_id")
 
         if not message_id:
-            raise Exception(f"Missing message_id in response: {result}")
+            raise Exception("Genie API response was missing message_id")
 
         logger.info(f"Genie message sent: msg={message_id}")
 
@@ -105,6 +169,7 @@ async def send_message(conversation_id: str, content: str) -> dict:
 
         return {
             "message_id": message_id,
+            "ran_as": identity,
             "result": _extract_result(message_result),
         }
 
@@ -133,7 +198,7 @@ async def _poll_message(
         async with session.get(url, headers=auth_headers) as resp:
             if resp.status != 200:
                 error_text = await resp.text()
-                logger.warning(f"Genie poll error ({resp.status}): {error_text}")
+                logger.warning(f"Genie poll error ({resp.status}): {error_text[:2000]}")
                 # Keep polling on transient errors
                 continue
 
@@ -149,8 +214,8 @@ async def _poll_message(
                 )
                 return result
             elif status in ("FAILED", "CANCELLED"):
-                error_msg = result.get("error", "Unknown error")
-                raise Exception(f"Genie query failed: {error_msg}")
+                logger.error("Genie query failed: %s", result.get("error", "unknown error"))
+                raise Exception("The Genie query failed.")
             # Otherwise keep polling (SUBMITTED, IN_PROGRESS, EXECUTING_QUERY, etc.)
 
     raise Exception(f"Genie message timed out after {timeout_seconds} seconds")
@@ -208,7 +273,7 @@ async def _fetch_query_results_if_needed(
                     else:
                         error_text = await resp.text()
                         logger.warning(
-                            f"Failed to fetch query result by attachment ({resp.status}): {error_text}"
+                            f"Failed to fetch query result by attachment ({resp.status}): {error_text[:2000]}"
                         )
             except Exception as e:
                 logger.warning(f"Error fetching query result by attachment: {e}")
